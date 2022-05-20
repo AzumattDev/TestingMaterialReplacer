@@ -17,10 +17,10 @@ namespace PieceManager
             _objectToSwap = new Dictionary<GameObject, bool>();
             _objectsForShaderReplace = new Dictionary<GameObject, ShaderType>();
             Harmony harmony = new("org.bepinex.helpers.PieceManager");
-            harmony.Patch(AccessTools.DeclaredMethod(typeof(ObjectDB), nameof(ObjectDB.Awake)),
+            harmony.Patch(AccessTools.DeclaredMethod(typeof(ZoneSystem), nameof(ZoneSystem.Start)),
                 postfix: new HarmonyMethod(AccessTools.DeclaredMethod(typeof(MaterialReplacer),
                     nameof(GetAllMaterials))));
-            harmony.Patch(AccessTools.DeclaredMethod(typeof(ObjectDB), nameof(ObjectDB.Awake)),
+            harmony.Patch(AccessTools.DeclaredMethod(typeof(ZoneSystem), nameof(ZoneSystem.Start)),
                 postfix: new HarmonyMethod(AccessTools.DeclaredMethod(typeof(MaterialReplacer),
                     nameof(ReplaceAllMaterialsWithOriginal))));
         }
