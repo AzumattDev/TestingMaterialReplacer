@@ -3,7 +3,6 @@ using System.Collections.Generic;
 using System.Linq;
 using HarmonyLib;
 using JetBrains.Annotations;
-using TestingMaterialReplacer;
 using UnityEngine;
 
 namespace PieceManager
@@ -66,11 +65,11 @@ namespace PieceManager
                          gameObject.Key.GetComponentsInChildren<Renderer>(true)))
             {
                 _objectToSwap.TryGetValue(renderer.gameObject, out bool jotunnPrefabFlag);
-                for (int i = 0; i < renderer.materials.Length; i++)
+                foreach (var t in renderer.materials)
                 {
                     if (jotunnPrefabFlag)
                     {
-                        if (!renderer.materials[i].name.StartsWith("JVLmock_")) continue;
+                        if (!t.name.StartsWith("JVLmock_")) continue;
                         var matName = renderer.material.name.Replace(" (Instance)", string.Empty)
                             .Replace("JVLmock_", "");
 
@@ -87,20 +86,10 @@ namespace PieceManager
                     }
                     else
                     {
-                        if (!renderer.materials[i].name.Contains("_REPLACE_")) continue;
-                        TestingMaterialReplacerPlugin.TestingMaterialReplacerLogger.LogWarning(
-                            $"----BEFORE: {renderer.material.name}");
-                        string matName = renderer.material.name.Replace(" (Instance)", string.Empty)
-                            .Replace("_REPLACE_", string.Empty);
-                        TestingMaterialReplacerPlugin.TestingMaterialReplacerLogger.LogWarning(
-                            $"----AFTER: {matName}");
+                        if (!t.name.StartsWith("_REPLACE_")) continue;
+                        var matName = renderer.material.name.Replace(" (Instance)", string.Empty)
+                            .Replace("_REPLACE_", "");
 
-                        TestingMaterialReplacerPlugin.TestingMaterialReplacerLogger.LogWarning(
-                            $"----BEFORE#2: {renderer.materials[i].name}");
-                        string name = renderer.materials[i].name.Replace(" (Instance)", string.Empty)
-                            .Replace("_REPLACE_", string.Empty);
-                        TestingMaterialReplacerPlugin.TestingMaterialReplacerLogger.LogWarning(
-                            $"----AFTER#2: {name}");
                         if (originalMaterials.ContainsKey(matName))
                         {
                             renderer.material = originalMaterials[matName];
@@ -110,17 +99,6 @@ namespace PieceManager
                             Debug.LogWarning("No suitable material found to replace: " + matName);
                             // Skip over this material in future
                             originalMaterials[matName] = renderer.material;
-                        }
-
-                        if (originalMaterials.ContainsKey(name))
-                        {
-                            renderer.materials[i] = originalMaterials[name];
-                        }
-                        else
-                        {
-                            Debug.LogWarning("No suitable material found to replaceSECOND: " + name);
-                            // Skip over this material in future
-                            originalMaterials[name] = renderer.material;
                         }
                     }
                 }
