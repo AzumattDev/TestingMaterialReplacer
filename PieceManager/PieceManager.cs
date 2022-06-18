@@ -1,5 +1,9 @@
 ﻿using System;
+using System.Collections;
 using System.Collections.Generic;
+using System.ComponentModel;
+using System.IO;
+using System.IO.Compression;
 using System.Linq;
 using System.Reflection;
 using System.Text.RegularExpressions;
@@ -12,14 +16,46 @@ using UnityEngine;
 namespace PieceManager;
 
 [PublicAPI]
-public enum BuildPieceCategory
+public enum CraftingTable
 {
     None,
+    [InternalName("piece_workbench")] Workbench,
+    [InternalName("piece_cauldron")] Cauldron,
+    [InternalName("forge")] Forge,
+    [InternalName("piece_artisanstation")] ArtisanTable,
+    [InternalName("piece_stonecutter")] StoneCutter,
+    Custom
+}
+
+public class InternalName : Attribute
+{
+    public readonly string internalName;
+    public InternalName(string internalName) => this.internalName = internalName;
+}
+
+[PublicAPI]
+public class CraftingStationList
+{
+    public readonly List<CraftingStationConfig> Stations = new();
+
+    public void Set(CraftingTable table) => Stations.Add(new CraftingStationConfig { Table = table });
+    public void Set(string customTable) => Stations.Add(new CraftingStationConfig { Table = CraftingTable.Custom, custom = customTable });
+}
+
+public struct CraftingStationConfig
+{
+    public CraftingTable Table;
+    public int level;
+    public string? custom;
+}
+
+[PublicAPI]
+public enum BuildPieceCategory
+{
     Misc = 0,
     Crafting = 1,
     Building = 2,
     Furniture = 3,
-    Max = 4,
     All = 100,
     Custom
 }
@@ -40,23 +76,30 @@ public struct Requirement
     public bool recover;
 }
 
+public struct SpecialProperties
+{
+    [Description("Admins should be the only ones that can build this piece.")]
+    public bool AdminOnly;
+    [Description("Turns off generating a config for this build piece.")]
+    public bool NoConfig;
+}
+
 [PublicAPI]
 public class BuildingPieceCategoryList
 {
     public readonly List<BuildPieceTableConfig> BuildPieceCategories = new();
 
-    public void Add(BuildPieceCategory category, bool useCategories) => BuildPieceCategories.Add(
+    public void Add(BuildPieceCategory category) => BuildPieceCategories.Add(
         new BuildPieceTableConfig
-            { Category = category, UseCategories = useCategories });
+            { Category = category });
 
-    public void Add(string customCategory, bool useCategories) => BuildPieceCategories.Add(new BuildPieceTableConfig
-        { Category = BuildPieceCategory.Custom, UseCategories = useCategories, custom = customCategory });
+    public void Add(string customCategory) => BuildPieceCategories.Add(new BuildPieceTableConfig
+        { Category = BuildPieceCategory.Custom, custom = customCategory });
 }
 
 public struct BuildPieceTableConfig
 {
     public BuildPieceCategory Category;
-    public bool UseCategories;
     public string? custom;
 }
 
@@ -68,23 +111,30 @@ public class BuildPiece
         public ConfigEntry<string> craft = null!;
         public ConfigEntry<BuildPieceCategory> category = null!;
         public ConfigEntry<string> customCategory = null!;
+        public ConfigEntry<CraftingTable> table = null!;
+        public ConfigEntry<string> customTable = null!;
     }
 
-    private static readonly List<BuildPiece> registeredPieces = new();
+    internal static readonly List<BuildPiece> registeredPieces = new();
     private static Dictionary<BuildPiece, PieceConfig> pieceConfigs = new();
 
+    [Description("Disables generation of the configs for your pieces. This is global, this turns it off for all pieces in your mod.")]
     public static bool ConfigurationEnabled = true;
 
     public readonly GameObject Prefab;
-
-    /// <summary>
-    /// Specifies the resources needed to craft the piece.
-    /// <para>Use .Add to add resources with their internal ID and an amount.</para>
-    /// <para>Use one .Add for each resource type the item should need.</para>
-    /// </summary>
+    
+    [Description("Specifies the resources needed to craft the piece.\nUse .Add to add resources with their internal ID and an amount.\nUse one .Add for each resource type the building piece should need.")]
     public readonly RequiredResourcesList RequiredItems = new();
 
+    [Description("Sets the category for the building piece.")]
     public readonly BuildingPieceCategoryList Category = new();
+
+    [Description(
+        "Specifies the crafting station needed to build your piece.\nUse .Add to add a crafting station, using the CraftingTable enum and a minimum level for the crafting station.")]
+    public CraftingStationList Crafting = new();
+    
+    [Description("Change the extended/special properties of your build piece.")]
+    public SpecialProperties SpecialProperties;
 
     private LocalizeKey? _name;
 
@@ -163,38 +213,132 @@ public class BuildPiece
     {
         [UsedImplicitly] public int? Order;
         [UsedImplicitly] public bool? Browsable;
+        [UsedImplicitly] public string? Category;
         [UsedImplicitly] public Action<ConfigEntryBase>? CustomDrawer;
     }
 
+    private static object? configManager;
+
     internal static void Patch_FejdStartup()
     {
+        Assembly? bepinexConfigManager = AppDomain.CurrentDomain.GetAssemblies().FirstOrDefault(a => a.GetName().Name == "ConfigurationManager");
+
+        Type? configManagerType = bepinexConfigManager?.GetType("ConfigurationManager.ConfigurationManager");
+        configManager = configManagerType == null ? null : BepInEx.Bootstrap.Chainloader.ManagerObject.GetComponent(configManagerType);
+        void ReloadConfigDisplay() => configManagerType?.GetMethod("BuildSettingList")!.Invoke(configManager, Array.Empty<object>());
+        
+        
         if (ConfigurationEnabled)
         {
+            bool SaveOnConfigSet = plugin.Config.SaveOnConfigSet;
+            plugin.Config.SaveOnConfigSet = false;
             foreach (BuildPiece piece in registeredPieces)
             {
+                if (piece.SpecialProperties.NoConfig) continue;
                 PieceConfig cfg = pieceConfigs[piece] = new PieceConfig();
-                string pieceName = piece.Prefab.GetComponent<Piece>().m_name;
-                string localizedName = new Regex("['[\"\\]]").Replace(english.Localize(pieceName), "").Trim();
+                Piece piecePrefab = piece.Prefab.GetComponent<Piece>();
+                string pieceName = piecePrefab.m_name;
+                string englishName = new Regex("['[\"\\]]").Replace(english.Localize(pieceName), "").Trim();
+                string localizedName = Localization.instance.Localize(pieceName).Trim();
 
                 int order = 0;
+
+                cfg.category = config(englishName, "Build Table Category",
+                    piece.Category.BuildPieceCategories.First().Category,
+                    new ConfigDescription($"Build Category where {englishName} is available.", null,
+                        new ConfigurationManagerAttributes { Order = --order, Category = localizedName }));
+                ConfigurationManagerAttributes customTableAttributes = new()
+                {
+                    Order = --order, Browsable = cfg.category.Value == BuildPieceCategory.Custom,
+                    Category = localizedName
+                };
+                cfg.customCategory = config(englishName, "Custom Build Category",
+                    piece.Category.BuildPieceCategories.First().custom ?? "",
+                    new ConfigDescription("", null, customTableAttributes));
+
+                void BuildTableConfigChanged(object o, EventArgs e)
+                {
+                    if (registeredPieces.Count > 0)
+                    {
+                        if (cfg.category.Value is BuildPieceCategory.Custom)
+                        {
+                            // broken
+                            // piece.Prefab.GetComponent<Piece>().m_category = (Piece.PieceCategory)ZNetScene.instance.GetPrefab(cfg.customCategory.Value)?.GetComponent<Piece>().m_category;
+                        }
+                        else
+                        {
+                            piecePrefab.m_category = (Piece.PieceCategory)cfg.category.Value;
+                        }
+                    }
+
+                    customTableAttributes.Browsable = cfg.category.Value == BuildPieceCategory.Custom;
+                    ReloadConfigDisplay();
+                }
+
+                cfg.category.SettingChanged += BuildTableConfigChanged;
+                cfg.customCategory.SettingChanged += BuildTableConfigChanged;
+
+                if (cfg.category.Value != BuildPieceCategory.Custom)
+                {
+                    piecePrefab.m_category = (Piece.PieceCategory)cfg.category.Value;
+                }
+                
+                if (piece.Crafting.Stations.Count > 0)
+				{
+
+					List<ConfigurationManagerAttributes> hideWhenNoneAttributes = new();
+
+					cfg.table = config(localizedName, "Crafting Station", piece.Crafting.Stations.First().Table, new ConfigDescription($"Crafting station where {localizedName} is available.", null, new ConfigurationManagerAttributes { Order = --order }));
+                    cfg.customTable = config(localizedName, "Custom Crafting Station", piece.Crafting.Stations.First().custom ?? "", new ConfigDescription("", null, customTableAttributes));
+
+					void TableConfigChanged(object o, EventArgs e)
+					{
+						if (piece.RequiredItems.Requirements.Count > 0)
+                        {
+                            switch (cfg.table.Value)
+                            {
+                                case CraftingTable.None:
+                                    piecePrefab.m_craftingStation = null;
+                                    break;
+                                case CraftingTable.Custom:
+                                    piecePrefab.m_craftingStation = ZNetScene.instance.GetPrefab(cfg.customTable.Value)?.GetComponent<CraftingStation>();
+                                    break;
+                                default:
+                                    piecePrefab.m_craftingStation = ZNetScene.instance.GetPrefab(((InternalName)typeof(CraftingTable).GetMember(cfg.table.Value.ToString())[0].GetCustomAttributes(typeof(InternalName)).First()).internalName).GetComponent<CraftingStation>();
+                                    break;
+                            }
+                        }
+						customTableAttributes.Browsable = cfg.table.Value == CraftingTable.Custom;
+						foreach (ConfigurationManagerAttributes attributes in hideWhenNoneAttributes)
+						{
+							attributes.Browsable = cfg.table.Value != CraftingTable.None;
+						}
+                        ReloadConfigDisplay();
+					}
+					cfg.table.SettingChanged += TableConfigChanged;
+					cfg.customTable.SettingChanged += TableConfigChanged;
+
+					ConfigurationManagerAttributes tableLevelAttributes = new() { Order = --order, Browsable = cfg.table.Value != CraftingTable.None };
+					hideWhenNoneAttributes.Add(tableLevelAttributes);
+				}
 
                 ConfigEntry<string> itemConfig(string name, string value, string desc)
                 {
                     ConfigurationManagerAttributes attributes = new()
-                        { CustomDrawer = drawConfigTable, Order = --order };
-                    return config(localizedName, name, value, new ConfigDescription(desc, null, attributes));
+                        { CustomDrawer = DrawConfigTable, Order = --order, Category = localizedName };
+                    return config(englishName, name, value, new ConfigDescription(desc, null, attributes));
                 }
 
                 cfg.craft = itemConfig("Crafting Costs",
                     new SerializedRequirements(piece.RequiredItems.Requirements).ToString(),
-                    $"Item costs to craft {localizedName}");
+                    $"Item costs to craft {englishName}");
                 cfg.craft.SettingChanged += (_, _) =>
                 {
                     if (ObjectDB.instance && ObjectDB.instance.GetItemPrefab("Wood") != null)
                     {
                         Piece.Requirement[] requirements =
                             SerializedRequirements.toPieceReqs(new SerializedRequirements(cfg.craft.Value));
-                        piece.Prefab.GetComponent<Piece>().m_resources = requirements;
+                        piecePrefab.m_resources = requirements;
                         foreach (Piece instantiatedPiece in UnityEngine.Object.FindObjectsOfType<Piece>())
                         {
                             if (instantiatedPiece.m_name == pieceName)
@@ -204,6 +348,11 @@ public class BuildPiece
                         }
                     }
                 };
+            }
+            if (SaveOnConfigSet)
+            {
+                plugin.Config.SaveOnConfigSet = true;
+                plugin.Config.Save();
             }
         }
     }
@@ -222,10 +371,34 @@ public class BuildPiece
             piece.Prefab.GetComponent<Piece>().m_resources = SerializedRequirements.toPieceReqs(cfg == null
                 ? new SerializedRequirements(piece.RequiredItems.Requirements)
                 : new SerializedRequirements(cfg.craft.Value));
+            foreach (CraftingStationConfig station in piece.Crafting.Stations)
+            {
+               
+                if ((cfg == null || piece.Crafting.Stations.Count > 0 ? station.Table : cfg.table.Value) is CraftingTable.None)
+                {
+                    piece.Prefab.GetComponent<Piece>().m_craftingStation = null;
+                }
+                else if ((cfg == null || piece.Crafting.Stations.Count > 0 ? station.Table : cfg.table.Value) is CraftingTable.Custom)
+                {
+                    if (ZNetScene.instance.GetPrefab(cfg == null || piece.Crafting.Stations.Count > 0 ? station.custom : cfg.customTable.Value) is { } craftingTable)
+                    {
+                        piece.Prefab.GetComponent<Piece>().m_craftingStation = craftingTable.GetComponent<CraftingStation>();
+                    }
+                    else
+                    {
+                        Debug.LogWarning($"Custom crafting station '{(cfg == null || piece.Crafting.Stations.Count > 0 ? station.custom : cfg.customTable.Value)}' does not exist");
+                    }
+                }
+                else
+                {
+                    piece.Prefab.GetComponent<Piece>().m_craftingStation = ZNetScene.instance.GetPrefab(((InternalName)typeof(CraftingTable).GetMember((cfg == null || piece.Crafting.Stations.Count > 0 ? station.Table : cfg.table.Value).ToString())[0].GetCustomAttributes(typeof(InternalName)).First()).internalName).GetComponent<CraftingStation>();
+                }
+            }
+
         }
     }
 
-    private static void drawConfigTable(ConfigEntryBase cfg)
+    private static void DrawConfigTable(ConfigEntryBase cfg)
     {
         bool locked = cfg.Description.Tags
             .Select(a =>
@@ -235,6 +408,8 @@ public class BuildPiece
 
         List<Requirement> newReqs = new();
         bool wasUpdated = false;
+
+        int RightColumnWidth = (int)(configManager?.GetType().GetProperty("RightColumnWidth", BindingFlags.Instance | BindingFlags.NonPublic)!.GetGetMethod(true).Invoke(configManager, Array.Empty<object>()) ?? 130);
 
         GUILayout.BeginVertical();
         foreach (Requirement req in new SerializedRequirements((string)cfg.BoxedValue).Reqs)
@@ -250,7 +425,7 @@ public class BuildPiece
                 wasUpdated = true;
             }
 
-            string newItemName = GUILayout.TextField(req.itemName);
+            string newItemName = GUILayout.TextField(req.itemName, new GUIStyle(GUI.skin.textField) { fixedWidth = RightColumnWidth - 40 - 67 - 21 - 21 - 12 });
             string itemName = locked ? req.itemName : newItemName;
             wasUpdated = wasUpdated || itemName != req.itemName;
 
@@ -350,9 +525,9 @@ public class BuildPiece
         }
     }
 
-    private static BaseUnityPlugin? _plugin;
+    internal static BaseUnityPlugin? _plugin;
 
-    private static BaseUnityPlugin plugin
+    internal static BaseUnityPlugin plugin
     {
         get
         {
@@ -415,9 +590,23 @@ public class BuildPiece
 [PublicAPI]
 public class LocalizeKey
 {
+    private static readonly List<LocalizeKey> keys = new();
+
     public readonly string Key;
+    public readonly Dictionary<string, string> Localizations = new();
 
     public LocalizeKey(string key) => Key = key.Replace("$", "");
+    
+    public void Alias(string alias)
+    {
+        Localizations.Clear();
+        if (!alias.Contains("$"))
+        {
+            alias = $"${alias}";
+        }
+        Localizations["alias"] = alias;
+        Localization.instance.AddWord(Key, Localization.instance.Localize(alias));
+    }
 
     public LocalizeKey English(string key) => addForLang("English", key);
     public LocalizeKey Swedish(string key) => addForLang("Swedish", key);
@@ -456,6 +645,7 @@ public class LocalizeKey
 
     private LocalizeKey addForLang(string lang, string value)
     {
+        Localizations[lang] = value;
         if (Localization.instance.GetSelectedLanguage() == lang)
         {
             Localization.instance.AddWord(Key, value);
@@ -464,9 +654,212 @@ public class LocalizeKey
         {
             Localization.instance.AddWord(Key, value);
         }
-
         return this;
     }
+
+    [HarmonyPriority(Priority.LowerThanNormal)]
+    internal static void AddLocalizedKeys(Localization __instance, string language)
+    {
+        foreach (LocalizeKey key in keys)
+        {
+            if (key.Localizations.TryGetValue(language, out string Translation) || key.Localizations.TryGetValue("English", out Translation))
+            {
+                __instance.AddWord(key.Key, Translation);
+            }
+            else if (key.Localizations.TryGetValue("alias", out string alias))
+            {
+                Localization.instance.AddWord(key.Key, Localization.instance.Localize(alias));
+            }
+        }
+    }
+}
+
+
+public class AdminSyncing
+{
+    private static bool isServer;
+    [HarmonyPriority(Priority.VeryHigh)]
+    internal static void AdminStatusSync(ZNet __instance)
+    {
+        isServer = __instance.IsServer();
+        ZRoutedRpc.instance.Register<ZPackage>(BuildPiece._plugin.Info.Metadata.Name + " PMAdminStatusSync", RPC_AdminPieceAddRemove);
+
+        IEnumerator WatchAdminListChanges()
+        {
+            List<string> CurrentList = new(ZNet.instance.m_adminList.GetList());
+            for (;;)
+            {
+                yield return new WaitForSeconds(30);
+                if (!ZNet.instance.m_adminList.GetList().SequenceEqual(CurrentList))
+                {
+                    CurrentList = new List<string>(ZNet.instance.m_adminList.GetList());
+                    List<ZNetPeer> adminPeer = ZNet.instance.GetPeers().Where(p =>
+                        ZNet.instance.m_adminList.Contains(p.m_rpc.GetSocket().GetHostName())).ToList();
+                    List<ZNetPeer> nonAdminPeer = ZNet.instance.GetPeers().Except(adminPeer).ToList();
+                    SendAdmin(nonAdminPeer, false);
+                    SendAdmin(adminPeer, true);
+
+                    void SendAdmin(List<ZNetPeer> peers, bool isAdmin)
+                    {
+                        ZPackage package = new();
+                        package.Write(isAdmin);
+                        ZNet.instance.StartCoroutine(sendZPackage(peers, package));
+                    }
+                }
+            }
+            // ReSharper disable once IteratorNeverReturns
+        }
+
+        if (isServer)
+        {
+            ZNet.instance.StartCoroutine(WatchAdminListChanges());
+        }
+    }
+
+    private static IEnumerator sendZPackage(List<ZNetPeer> peers, ZPackage package)
+    {
+        if (!ZNet.instance)
+        {
+            yield break;
+        }
+        const int compressMinSize = 10000;
+
+        if (package.GetArray() is { LongLength: > compressMinSize } rawData)
+        {
+            ZPackage compressedPackage = new();
+            compressedPackage.Write(4);
+            MemoryStream output = new();
+            using (DeflateStream deflateStream = new(output, System.IO.Compression.CompressionLevel.Optimal))
+            {
+                deflateStream.Write(rawData, 0, rawData.Length);
+            }
+            compressedPackage.Write(output.ToArray());
+            package = compressedPackage;
+        }
+        List<IEnumerator<bool>> writers = peers.Where(peer => peer.IsReady()).Select(p => TellPeerAdminStatus(p, package)).ToList();
+        writers.RemoveAll(writer => !writer.MoveNext());
+        while (writers.Count > 0)
+        {
+            yield return null;
+            writers.RemoveAll(writer => !writer.MoveNext());
+        }
+    }
+    
+    private static IEnumerator<bool> TellPeerAdminStatus(ZNetPeer peer, ZPackage package)
+    {
+        if (ZRoutedRpc.instance is not { } rpc)
+        {
+            yield break;
+        }
+        
+        SendPackage(package);
+
+        void SendPackage(ZPackage pkg)
+        {
+            string method = BuildPiece._plugin.Info.Metadata.Name + " PMAdminStatusSync";
+            if (isServer)
+            {
+                peer.m_rpc.Invoke(method, pkg);
+            }
+            else
+            {
+                rpc.InvokeRoutedRPC(peer.m_server ? 0 : peer.m_uid, method, pkg);
+            }
+        }
+    }
+
+    internal static void RPC_AdminPieceAddRemove(long sender, ZPackage package)
+    {
+        ZNetPeer? currentPeer = ZNet.instance.GetPeer(sender);
+        bool admin = false;
+        try
+        {
+            admin = package.ReadBool();
+        }
+        catch
+        {
+            // ignore
+        }
+
+        if (isServer)
+        {
+            ZRoutedRpc.instance.InvokeRoutedRPC(ZRoutedRpc.Everybody,
+                BuildPiece._plugin.Info.Metadata.Name + " PMAdminStatusSync", new ZPackage());
+            if (ZNet.instance.m_adminList.Contains(currentPeer.m_rpc.GetSocket().GetHostName()))
+            {
+                ZPackage pkg = new();
+                pkg.Write(true);
+                currentPeer.m_rpc.Invoke(BuildPiece._plugin.Info.Metadata.Name + " PMAdminStatusSync", pkg);
+            }
+        }
+        else
+        {
+            // Remove everything they shouldn't be able to build by disabling and removing.
+            foreach (BuildPiece piece in BuildPiece.registeredPieces)
+            {
+                if (!piece.SpecialProperties.AdminOnly) continue;
+                Piece piecePrefab = piece.Prefab.GetComponent<Piece>();
+                string pieceName = piecePrefab.m_name;
+                string localizedName = Localization.instance.Localize(pieceName).Trim();
+                if (!ObjectDB.instance || ObjectDB.instance.GetItemPrefab("Wood") == null) continue;
+                foreach (Piece instantiatedPiece in UnityEngine.Object.FindObjectsOfType<Piece>())
+                {
+                    if (admin)
+                    {
+                        if (instantiatedPiece.m_name == pieceName)
+                        {
+                            instantiatedPiece.m_enabled = true;
+                        }
+                    }
+                    else
+                    {
+                        if (instantiatedPiece.m_name == pieceName)
+                        {
+                            instantiatedPiece.m_enabled = false;
+                        }
+                    }
+                }
+
+                List<GameObject>? hammerPieces = ObjectDB.instance.GetItemPrefab("Hammer").GetComponent<ItemDrop>()
+                    .m_itemData.m_shared.m_buildPieces
+                    .m_pieces;
+                if (admin)
+                {
+                    if (!hammerPieces.Contains(ZNetScene.instance.GetPrefab(piecePrefab.name)))
+                        hammerPieces.Add(ZNetScene.instance.GetPrefab(piecePrefab.name));
+                }
+                else
+                {
+                    if (hammerPieces.Contains(ZNetScene.instance.GetPrefab(piecePrefab.name)))
+                        hammerPieces.Remove(ZNetScene.instance.GetPrefab(piecePrefab.name));
+                }
+            }
+        }
+    }
+
+}
+
+[HarmonyPatch(typeof(ZNet), nameof(ZNet.OnNewConnection))]
+class RegisterClientRPCPatch
+{
+    private static void Postfix(ZNet __instance, ZNetPeer peer)
+    {
+        if (!__instance.IsServer())
+        {
+            peer.m_rpc.Register<ZPackage>(BuildPiece._plugin.Info.Metadata.Name + " PMAdminStatusSync",
+                RPC_InitialAdminSync);
+        }
+        else
+        {
+            ZPackage packge = new();
+            packge.Write(__instance.m_adminList.Contains(peer.m_rpc.GetSocket().GetHostName()));
+
+            peer.m_rpc.Invoke(BuildPiece._plugin.Info.Metadata.Name + " PMAdminStatusSync", packge);
+        }
+    }
+
+    private static void RPC_InitialAdminSync(ZRpc rpc, ZPackage package) =>
+        AdminSyncing.RPC_AdminPieceAddRemove(0, package);
 }
 
 public static class PiecePrefabManager
@@ -480,12 +873,21 @@ public static class PiecePrefabManager
         harmony.Patch(AccessTools.DeclaredMethod(typeof(ZNetScene), nameof(ZNetScene.Awake)),
             new HarmonyMethod(AccessTools.DeclaredMethod(typeof(PiecePrefabManager),
                 nameof(Patch_ZNetSceneAwake))));
-        harmony.Patch(AccessTools.DeclaredMethod(typeof(ZNetScene), nameof(ZNetScene.Awake)),
+        harmony.Patch(AccessTools.DeclaredMethod(typeof(ZNet), nameof(ZNet.Awake)),
+            postfix: new HarmonyMethod(AccessTools.DeclaredMethod(typeof(AdminSyncing),
+                nameof(AdminSyncing.AdminStatusSync))));
+        harmony.Patch(AccessTools.DeclaredMethod(typeof(ObjectDB), nameof(ObjectDB.Awake)),
             postfix: new HarmonyMethod(AccessTools.DeclaredMethod(typeof(PiecePrefabManager),
-                nameof(Patch_ZNetSceneAwakePost))));
+                nameof(Patch_ObjectDBInit))));
+        harmony.Patch(AccessTools.DeclaredMethod(typeof(ObjectDB), nameof(ObjectDB.CopyOtherDB)),
+            postfix: new HarmonyMethod(AccessTools.DeclaredMethod(typeof(PiecePrefabManager),
+                nameof(Patch_ObjectDBInit))));
         harmony.Patch(AccessTools.DeclaredMethod(typeof(ObjectDB), nameof(ObjectDB.Awake)),
             postfix: new HarmonyMethod(AccessTools.DeclaredMethod(typeof(BuildPiece),
                 nameof(BuildPiece.Patch_ObjectDBInit))));
+        harmony.Patch(AccessTools.DeclaredMethod(typeof(Localization), nameof(Localization.LoadCSV)),
+            postfix: new HarmonyMethod(AccessTools.DeclaredMethod(typeof(LocalizeKey),
+                nameof(LocalizeKey.AddLocalizedKeys))));
     }
 
     private struct BundleId
@@ -556,14 +958,15 @@ public static class PiecePrefabManager
     {
         foreach (GameObject prefab in piecePrefabs.Concat(ZnetOnlyPrefabs).Concat(customPiecePrefabs.Keys))
         {
-            __instance.m_prefabs.Add(prefab);
+            if(!__instance.m_prefabs.Contains(prefab))
+                __instance.m_prefabs.Add(prefab);
         }
     }
 
     [HarmonyPriority(Priority.VeryHigh)]
-    private static void Patch_ZNetSceneAwakePost(ZNetScene __instance)
+    private static void Patch_ObjectDBInit(ObjectDB __instance)
     {
-        if (__instance.GetPrefab("Hammer")?.GetComponent<ItemDrop>().m_itemData.m_shared.m_buildPieces is not
+        if (__instance.GetItemPrefab("Hammer")?.GetComponent<ItemDrop>().m_itemData.m_shared.m_buildPieces is not
             { } hammerPieces)
         {
             return;
@@ -571,16 +974,16 @@ public static class PiecePrefabManager
 
         foreach (KeyValuePair<GameObject, string> customPiecePrefab in customPiecePrefabs)
         {
-            if (__instance.GetPrefab(customPiecePrefab.Value)?.GetComponent<ItemDrop>().m_itemData.m_shared
+            if (__instance.GetItemPrefab(customPiecePrefab.Value)?.GetComponent<ItemDrop>().m_itemData.m_shared
                     .m_buildPieces is not
                 { } customPieces)
             {
-                return;
+                continue;
             }
 
             if (customPieces.m_pieces.Contains(customPiecePrefab.Key))
             {
-                return;
+                continue;
             }
 
             customPieces.m_pieces.Add(customPiecePrefab.Key);

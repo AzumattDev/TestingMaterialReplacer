@@ -40,7 +40,8 @@ namespace TestingMaterialReplacer
             examplePiece1.Description.English("Ward For testing the Piece Manager");
             examplePiece1.RequiredItems.Add("FineWood", 20,
                 false);
-            examplePiece1.Category.Add(BuildPieceCategory.Building, false);
+            examplePiece1.Category.Add(BuildPieceCategory.Building);
+            examplePiece1.Crafting.Set(CraftingTable.ArtisanTable);
 
             MaterialReplacer.RegisterGameObjectForMatSwap(examplePiece1.Prefab);
             MaterialReplacer.RegisterGameObjectForShaderSwap(examplePiece1.Prefab);
